@@ -30,7 +30,7 @@ VALID_TYPES = (TX_TRANSFER, TX_DEPLOY, TX_CALL, TX_COINBASE)
 class Transaction:
     def __init__(self, sender, to, amount, fee, nonce, tx_type=TX_TRANSFER,
                  data=None, signature=None, public_key=None, txid=None,
-                 timestamp=None):
+                 timestamp=None, replaces=None):
         self.sender = sender
         self.to = to
         self.amount = float(amount)
@@ -41,6 +41,9 @@ class Transaction:
         self.signature = signature
         self.public_key = public_key
         self.timestamp = timestamp or time.time()
+        # Pool metadata: txid of the pending transaction this one replaced
+        # (fee bump).  Deliberately excluded from the signed/hashed body.
+        self.replaces = replaces
         self.txid = txid or self.compute_txid()
 
     # ------------------------------------------------------------------ #
@@ -68,7 +71,7 @@ class Transaction:
         return self
 
     def to_dict(self):
-        return {
+        d = {
             "txid": self.txid,
             "sender": self.sender,
             "to": self.to,
@@ -81,6 +84,9 @@ class Transaction:
             "public_key": self.public_key,
             "timestamp": self.timestamp,
         }
+        if self.replaces:
+            d["replaces"] = self.replaces
+        return d
 
     @staticmethod
     def from_dict(d):
@@ -90,6 +96,7 @@ class Transaction:
             tx_type=d.get("type", TX_TRANSFER), data=d.get("data") or {},
             signature=d.get("signature"), public_key=d.get("public_key"),
             txid=d.get("txid"), timestamp=d.get("timestamp"),
+            replaces=d.get("replaces"),
         )
 
     # ------------------------------------------------------------------ #

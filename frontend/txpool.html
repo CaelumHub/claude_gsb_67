@@ -68,6 +68,18 @@
         </div>
         <div id="poolList" class="table-wrap" style="margin-top:12px;"></div>
       </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">提价替换记录 <span class="hint" id="replaceHint"></span></h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="refreshReplacements()">刷新</button>
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          同一账户、同一序号的待打包交易可用更高手续费反复替换；被替换的旧交易会在此留痕。
+        </div>
+        <div id="replaceList" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
     </main>
   </div>
 </div>
@@ -81,6 +93,7 @@ let wallets = [];
 async function init() {
   await loadWallets();
   await refreshPool();
+  await refreshReplacements();
   await loadConfig();
   pollStatus(4000);
 }
@@ -106,18 +119,68 @@ async function refreshPool() {
     return;
   }
   box.innerHTML = `<table><thead><tr>
-    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
+    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th>操作</th></tr></thead>
     <tbody>${d.transactions.map(t => `
       <tr>
-        <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}</td>
+        <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}
+          ${t.replaces ? `<div class="hint" title="替换自 ${esc(t.replaces)}">↻ 提价替换自 ${fmt.hash(t.replaces, 6)}</div>` : ""}
+        </td>
         <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
         <td class="addr">${fmt.addr(t.sender, 6)}</td>
         <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
         <td class="mono-num">${fmt.amount(t.amount)}</td>
         <td class="mono-num">${fmt.amount(t.fee)}</td>
         <td class="mono-num">${t.nonce}</td>
-        <td><button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button></td>
+        <td class="flex" style="gap:6px;">
+          <button class="btn amber sm" onclick="speedUp('${t.txid}', ${Number(t.fee)})">⚡ 提价加速</button>
+          <button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button>
+        </td>
       </tr>`).join("")}</tbody></table>`;
+}
+
+async function refreshReplacements() {
+  const d = await API.get("/api/txpool/replacements");
+  $("#replaceHint").textContent = `（${d.count} 条）`;
+  const box = $("#replaceList");
+  if (!d.count) {
+    box.innerHTML = `<div class="empty"><div class="big">🧾</div>暂无替换记录</div>`;
+    return;
+  }
+  const rows = d.replacements.slice().reverse().map(r => `
+    <tr>
+      <td class="mono-num">${fmt.time(r.replaced_at)}</td>
+      <td class="addr">${fmt.addr(r.sender, 6)}</td>
+      <td class="mono-num">${r.nonce}</td>
+      <td class="hash" title="${esc(r.old_txid)}">${fmt.hash(r.old_txid, 8)}</td>
+      <td>➜</td>
+      <td class="hash" title="${esc(r.new_txid)}">${fmt.hash(r.new_txid, 8)}</td>
+      <td class="mono-num">${fmt.amount(r.old_fee)} ➜ ${fmt.amount(r.new_fee)}</td>
+    </tr>`).join("");
+  box.innerHTML = `<table><thead><tr>
+    <th>时间</th><th>发送方</th><th>Nonce</th><th>旧交易ID</th><th></th><th>新交易ID</th><th>手续费</th></tr>
+  </thead><tbody>${rows}</tbody></table>`;
+}
+
+async function speedUp(txid, currentFee) {
+  const input = prompt(`请输入新的手续费（必须严格高于当前手续费 ${currentFee}）：`, currentFee);
+  if (input === null) return;
+  const fee = parseFloat(input);
+  if (!(fee > currentFee)) {
+    return toast(`手续费必须严格高于 ${currentFee}，已拒绝`, "err");
+  }
+  try {
+    const d = await API.post("/api/tx/speed_up", { txid, fee });
+    if (d.ok) {
+      toast(`已替换: ${fmt.hash(d.txid, 8)}（手续费 ${fee}）`, "ok");
+      await refreshPool();
+      await refreshReplacements();
+    } else {
+      toast(d.error || "替换被拒绝", "err");
+    }
+  } catch (e) {
+    const reason = (e.data && (e.data.error || e.data.reason)) || e.message;
+    toast("替换被拒绝: " + reason, "err");
+  }
 }
 
 async function submitTransfer() {
@@ -133,6 +196,7 @@ async function submitTransfer() {
     const d = await API.post("/api/tx/transfer", { from, to, amount, fee });
     toast(d.ok ? "交易已提交: " + fmt.hash(d.txid, 8) : d.reason, d.ok ? "ok" : "err");
     await refreshPool();
+    if (d.ok) await refreshReplacements();
   } catch (e) { toast(e.message, "err"); }
 }
 

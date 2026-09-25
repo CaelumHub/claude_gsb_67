@@ -218,6 +218,34 @@ def create_app(node):
         return _json({"ok": ok, "reason": reason, "txid": tx.txid},
                      status=200 if ok else 400)
 
+    @app.post("/api/tx/replace")
+    def tx_replace():
+        """Explicitly replace a pending tx with a signed higher-fee version."""
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            tx = Transaction.from_dict(data)
+        except Exception as e:  # noqa: BLE001
+            return _json({"ok": False, "error": f"malformed tx: {e}"}, 400)
+        ok, reason = node.replace_transaction(tx)
+        return _json({"ok": ok, "reason": reason, "txid": tx.txid,
+                      "replaces": tx.replaces},
+                     status=200 if ok else 400)
+
+    @app.post("/api/tx/speed_up")
+    def tx_speed_up():
+        """Rebuild a pending tx with a higher fee, re-sign, and replace it."""
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            fee = float(data.get("fee"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid fee"}, 400)
+        tx, err = node.speed_up_transaction(
+            fee, txid=data.get("txid"), sender=data.get("sender"))
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        return _json({"ok": True, "reason": "replaced", "txid": tx.txid,
+                      "replaces": tx.replaces, "fee": tx.fee})
+
     @app.post("/api/tx/transfer")
     def tx_transfer():
         data = request.get_json(force=True, silent=True) or {}
@@ -245,6 +273,12 @@ def create_app(node):
             "count": len(txs),
             "transactions": [tx.to_dict() for tx in txs],
         })
+
+    @app.get("/api/txpool/replacements")
+    def txpool_replacements():
+        """The replacement trace: every fee bump performed in this pool."""
+        history = node.txpool.replacement_history()
+        return _json({"count": len(history), "replacements": history})
 
     @app.get("/api/txpool/<txid>")
     def txpool_detail(txid):

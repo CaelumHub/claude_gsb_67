@@ -63,7 +63,7 @@ class Node:
         self.txpool.load(data, self.blockchain.state)
 
     def save_txpool(self):
-        atomic_write_json(self.paths.txpool_path, self.txpool.to_list())
+        atomic_write_json(self.paths.txpool_path, self.txpool.to_dict())
 
     def _register_configured_peers(self):
         for peer in self.cfg.get("peers", []):
@@ -168,9 +168,16 @@ class Node:
     # Transactions
     # ==================================================================== #
     def submit_transaction(self, tx, broadcast=True):
-        """Validate and admit a transaction; return ``(ok, reason)``."""
+        """Validate and admit a transaction; return ``(ok, reason)``.
+
+        If the sender already has a pending transaction, the submission is
+        treated as a fee-bump replacement attempt (same nonce and payload,
+        strictly higher fee) so replacements also propagate via P2P gossip.
+        """
         ok, reason = self.txpool.validate(tx, self.blockchain.state)
         if not ok:
+            if self.txpool.pending_tx_for(tx.sender) is not None:
+                return self.replace_transaction(tx, broadcast=broadcast)
             return False, reason
         self.txpool.add(tx)
         self.save_txpool()
@@ -178,6 +185,53 @@ class Node:
         if broadcast:
             self.broadcast_tx(tx)
         return True, "accepted"
+
+    def replace_transaction(self, tx, broadcast=True):
+        """Replace the sender's pending tx with a higher-fee version.
+
+        The old transaction stays visible through the pool's replacement
+        history.  Returns ``(ok, reason)``.
+        """
+        ok, reason = self.txpool.validate_replacement(tx, self.blockchain.state)
+        if not ok:
+            return False, reason
+        record = self.txpool.replace(tx)
+        if record is None:
+            return False, "no pending transaction to replace"
+        self.save_txpool()
+        self.log("info", f"tx replaced in pool: {record['old_txid'][:16]}… -> "
+                         f"{record['new_txid'][:16]}… "
+                         f"(fee {record['old_fee']} -> {record['new_fee']})")
+        if broadcast:
+            self.broadcast_tx(tx)
+        return True, "replaced"
+
+    def speed_up_transaction(self, fee, txid=None, sender=None):
+        """Re-issue a pending transaction with a higher fee (``(tx, error)``).
+
+        The replacement keeps the original recipient, amount, nonce and
+        payload; only the fee rises.  The transaction is re-signed with the
+        local wallet, so the sender's key must live on this node.
+        """
+        old = None
+        if txid:
+            old = self.txpool.get(txid)
+        if old is None and sender:
+            old = self.txpool.pending_tx_for(sender)
+        if old is None:
+            return None, "no pending transaction to speed up"
+        if fee is None or fee <= old.fee:
+            return None, (f"new fee must be higher than current "
+                          f"pending fee {old.fee}")
+        tx = Transaction(old.sender, old.to, old.amount, fee, old.nonce,
+                         tx_type=old.tx_type, data=dict(old.data))
+        ok, reason = self.sign_tx_with_wallet(tx)
+        if not ok:
+            return None, reason
+        ok, reason = self.replace_transaction(tx)
+        if not ok:
+            return None, reason
+        return tx, None
 
     def sign_tx_with_wallet(self, tx):
         priv = self.wallets.private_key(tx.sender)
