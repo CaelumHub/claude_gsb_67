@@ -238,12 +238,49 @@ def create_app(node):
                       "amount": amount, "fee": fee},
                      status=200 if ok else 400)
 
+    @app.post("/api/tx/replace")
+    def tx_replace():
+        """Fee-bump the sender's pending transaction for their current nonce.
+
+        Recipient/amount are supplied by the client and must match the
+        transaction currently in the pool; only the fee may increase.
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        sender = data.get("from")
+        to = data.get("to")
+        try:
+            amount = float(data.get("amount", 0))
+            fee = float(data.get("fee", 0))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid amount/fee"}, 400)
+        if not crypto.is_valid_address(sender) or not crypto.is_valid_address(to):
+            return _json({"ok": False, "error": "invalid address"}, 400)
+        nonce = node.blockchain.state.nonce(sender)
+        existing = node.txpool.pending_for(sender, nonce)
+        if existing is None:
+            return _json({"ok": False,
+                          "error": "no pending transaction for this account/nonce "
+                                   "to replace; confirmed transactions cannot "
+                                   "be replaced"}, 400)
+        tx, err = node.create_transfer(sender, to, amount, fee)
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        ok, reason = node.submit_transaction(tx)
+        return _json({
+            "ok": ok, "reason": reason, "txid": tx.txid,
+            "replaced": ok and reason.startswith("replaced"),
+            "replaced_txid": existing.txid,
+            "old_fee": existing.fee, "new_fee": fee,
+            "amount": amount, "fee": fee,
+        }, status=200 if ok else 400)
+
     @app.get("/api/txpool")
     def txpool():
         txs = node.pending_transactions()
         return _json({
             "count": len(txs),
             "transactions": [tx.to_dict() for tx in txs],
+            "replacements": node.txpool.replacement_traces(),
         })
 
     @app.get("/api/txpool/<txid>")
@@ -251,7 +288,28 @@ def create_app(node):
         tx = node.txpool.get(txid)
         if not tx:
             return _json({"ok": False, "error": "not found"}, 404)
-        return _json({"ok": True, "transaction": tx.to_dict()})
+        trace = node.txpool.replacement_trace_for(tx.sender, tx.nonce)
+        return _json({
+            "ok": True,
+            "transaction": tx.to_dict(),
+            "replacement_trace": trace,
+            "replacement_events": node.txpool.replacement_events(txid=txid),
+        })
+
+    @app.get("/api/txpool/replacements/history")
+    def txpool_replacements_history():
+        sender = request.args.get("sender")
+        nonce = request.args.get("nonce")
+        try:
+            nonce = int(nonce) if nonce is not None else None
+        except ValueError:
+            return _json({"ok": False, "error": "invalid nonce"}, 400)
+        events = node.txpool.replacement_events(sender=sender, nonce=nonce)
+        return _json({
+            "count": len(events),
+            "active": node.txpool.replacement_traces(),
+            "events": events,
+        })
 
     @app.delete("/api/txpool/<txid>")
     def txpool_remove(txid):
@@ -259,7 +317,9 @@ def create_app(node):
 
     @app.post("/api/txpool/clear")
     def txpool_clear():
-        node.txpool.clear()
+        # Keep the replacement audit trail visible even after the pending set
+        # itself is emptied.
+        node.txpool.clear(keep_replacements=True)
         node.save_txpool()
         return _json({"ok": True})
 

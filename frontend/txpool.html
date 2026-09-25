@@ -68,6 +68,16 @@
         </div>
         <div id="poolList" class="table-wrap" style="margin-top:12px;"></div>
       </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">替换记录 <span class="hint" id="replaceHint"></span></h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="refreshPool()">刷新</button>
+        </div>
+        <div class="hint" style="margin-top:6px;">同一账户可对同一序号的待打包交易反复提价替换；被替换掉的旧交易会保留在这里可查。</div>
+        <div id="replaceList" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
     </main>
   </div>
 </div>
@@ -77,6 +87,8 @@
 <script>
 window.PAGE = "txpool";
 let wallets = [];
+let poolTxs = [];
+let replaceMap = {};
 
 async function init() {
   await loadWallets();
@@ -100,23 +112,57 @@ async function refreshPool() {
   $("#difficulty").textContent = s.difficulty;
   $("#hashrate").textContent = Math.round(s.hashrate).toLocaleString();
   $("#poolHint").textContent = `（${d.count} 条）`;
+  poolTxs = d.transactions || [];
+  replaceMap = {};
+  (d.replacements || []).forEach(r => { replaceMap[r.current_txid] = r; });
   const box = $("#poolList");
   if (!d.count) {
     box.innerHTML = `<div class="empty"><div class="big">🗂</div>交易池为空</div>`;
+  } else {
+    box.innerHTML = `<table><thead><tr>
+      <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
+      <tbody>${poolTxs.map(t => {
+        const r = replaceMap[t.txid];
+        return `
+        <tr>
+          <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}</td>
+          <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
+          <td class="addr">${fmt.addr(t.sender, 6)}</td>
+          <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
+          <td class="mono-num">${fmt.amount(t.amount)}</td>
+          <td class="mono-num">
+            ${fmt.amount(t.fee)}
+            ${r ? `<div class="hint" title="原始手续费 ${r.original_tx ? r.original_tx.fee : "—"}">↑ 已替换 ${r.replacement_count} 次</div>` : ""}
+          </td>
+          <td class="mono-num">${t.nonce}</td>
+          <td style="white-space:nowrap">
+            ${t.type === "transfer" ? `<button class="btn green sm" onclick="replaceTx('${t.txid}')">↑ 加价替换</button>` : ""}
+            <button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button>
+          </td>
+        </tr>`;
+      }).join("")}</tbody></table>`;
+  }
+  await refreshReplacements();
+}
+
+async function refreshReplacements() {
+  const h = await API.get("/api/txpool/replacements/history");
+  $("#replaceHint").textContent = `（${h.count} 次）`;
+  const box = $("#replaceList");
+  if (!h.count) {
+    box.innerHTML = `<div class="empty"><div class="big">🧾</div>暂无替换记录</div>`;
     return;
   }
   box.innerHTML = `<table><thead><tr>
-    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
-    <tbody>${d.transactions.map(t => `
+    <th>时间</th><th>发送方</th><th>Nonce</th><th>旧交易</th><th>新交易</th><th>手续费变化</th></tr></thead>
+    <tbody>${(h.events || []).slice().reverse().map(e => `
       <tr>
-        <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}</td>
-        <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
-        <td class="addr">${fmt.addr(t.sender, 6)}</td>
-        <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
-        <td class="mono-num">${fmt.amount(t.amount)}</td>
-        <td class="mono-num">${fmt.amount(t.fee)}</td>
-        <td class="mono-num">${t.nonce}</td>
-        <td><button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button></td>
+        <td class="small muted" title="${new Date(e.time * 1000).toLocaleString()}">${fmt.ago(e.time)}</td>
+        <td class="addr">${fmt.addr(e.sender, 6)}</td>
+        <td class="mono-num">${e.nonce}</td>
+        <td class="hash" title="${esc(e.replaced_txid)}">${fmt.hash(e.replaced_txid, 8)} <span class="badge">${fmt.amount(e.old_fee)}</span></td>
+        <td class="hash" title="${esc(e.replacement_txid)}">${fmt.hash(e.replacement_txid, 8)} <span class="badge green">${fmt.amount(e.new_fee)}</span></td>
+        <td class="mono-num">+${fmt.amount(e.fee_delta)}</td>
       </tr>`).join("")}</tbody></table>`;
 }
 
@@ -134,6 +180,26 @@ async function submitTransfer() {
     toast(d.ok ? "交易已提交: " + fmt.hash(d.txid, 8) : d.reason, d.ok ? "ok" : "err");
     await refreshPool();
   } catch (e) { toast(e.message, "err"); }
+}
+
+async function replaceTx(txid) {
+  const t = poolTxs.find(x => x.txid === txid);
+  if (!t) return toast("交易已不在交易池", "err");
+  const input = prompt(`为交易 ${fmt.hash(t.txid, 8)} 设置新手续费（当前 ${t.fee}，必须更高）`, String(t.fee + 1));
+  if (input === null) return;
+  const fee = parseFloat(input);
+  if (!(fee > t.fee)) return toast("新手续费必须严格高于当前手续费", "err");
+  try {
+    const d = await API.post("/api/tx/replace", {
+      from: t.sender, to: t.to, amount: t.amount, fee,
+    });
+    toast(d.ok
+      ? `已替换：${fmt.hash(d.replaced_txid, 8)} → ${fmt.hash(d.txid, 8)}（手续费 ${d.old_fee} → ${d.new_fee}）`
+      : (d.reason || "替换被拒绝"), d.ok ? "ok" : "err");
+    await refreshPool();
+  } catch (e) {
+    toast((e.data && (e.data.reason || e.data.error)) || e.message, "err");
+  }
 }
 
 async function mineNow() {

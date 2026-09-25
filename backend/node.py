@@ -63,7 +63,7 @@ class Node:
         self.txpool.load(data, self.blockchain.state)
 
     def save_txpool(self):
-        atomic_write_json(self.paths.txpool_path, self.txpool.to_list())
+        atomic_write_json(self.paths.txpool_path, self.txpool.to_dict())
 
     def _register_configured_peers(self):
         for peer in self.cfg.get("peers", []):
@@ -115,8 +115,7 @@ class Node:
 
             status, message = self.blockchain.add_block(block)
             if status == "extended":
-                included = {tx.txid for tx in candidates}
-                self.txpool.remove_many(included)
+                self.txpool.remove_included(candidates)
                 self.save_txpool()
                 self._record_events(self.blockchain.last_receipts, block.index)
                 self.sync_contract_files()
@@ -168,16 +167,33 @@ class Node:
     # Transactions
     # ==================================================================== #
     def submit_transaction(self, tx, broadcast=True):
-        """Validate and admit a transaction; return ``(ok, reason)``."""
-        ok, reason = self.txpool.validate(tx, self.blockchain.state)
-        if not ok:
-            return False, reason
-        self.txpool.add(tx)
-        self.save_txpool()
-        self.log("info", f"tx accepted into pool: {tx.txid[:16]}…")
+        """Validate and admit a transaction; return ``(ok, reason)``.
+
+        If the transaction targets a ``(sender, nonce)`` that already has a
+        pending transaction and passes the replace-by-fee checks, the current
+        pool entry is atomically swapped for it (leaving an audit event).
+        """
+        with self._lock:
+            ok, reason = self.txpool.validate(tx, self.blockchain.state)
+            if not ok:
+                return False, reason
+            existing = self.txpool.pending_for(tx.sender, tx.nonce)
+            if existing is not None:
+                self.txpool.replace(tx)
+                self.save_txpool()
+                self.log(
+                    "info",
+                    f"tx replaced in pool: {existing.txid[:16]}… -> "
+                    f"{tx.txid[:16]}… (fee {existing.fee} -> {tx.fee})")
+                result = True, f"replaced {existing.txid} (fee bump)"
+            else:
+                self.txpool.add(tx)
+                self.save_txpool()
+                self.log("info", f"tx accepted into pool: {tx.txid[:16]}…")
+                result = True, "accepted"
         if broadcast:
             self.broadcast_tx(tx)
-        return True, "accepted"
+        return result
 
     def sign_tx_with_wallet(self, tx):
         priv = self.wallets.private_key(tx.sender)
@@ -234,8 +250,7 @@ class Node:
         block = Block.from_dict(block_dict)
         status, message = self.blockchain.add_block(block)
         if status == "extended":
-            included = {tx.txid for tx in block.transactions}
-            self.txpool.remove_many(included)
+            self.txpool.remove_included(block.transactions)
             self.save_txpool()
             self._record_events(self.blockchain.last_receipts, block.index)
             self.sync_contract_files()
